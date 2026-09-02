@@ -9,29 +9,29 @@ from rich.console import Console
 import os
 
 # ------------------ TELEGRAM IMPORTS ------------------
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ChatAction
+from aiohttp import web
 
 console = Console()
 
-# ------------------ CONFIG (from environment) ------------------
-API_ID = int(os.environ.get("API_ID", 34766713))          # set in Render
+# ------------------ CONFIG (all from environment) ------------------
+API_ID = int(os.environ.get("API_ID", 34766713))          # optional, not used by PTB
 API_HASH = os.environ.get("API_HASH", "e736dfb03939c175fa52722d9fef7e41")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")                    # MUST be set
+BOT_TOKEN = os.environ.get("BOT_TOKEN")                   # REQUIRED – set in Render
 OWNER_ID = int(os.environ.get("OWNER_ID", 8854936887))
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")               # e.g. https://your-app.onrender.com
-PORT = int(os.environ.get("PORT", 8443))                  # Render sets this
-
-# (The old API_ID, API_HASH, BOT_TOKEN, OWNER_ID are no longer hardcoded)
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")              # e.g. https://your-app.onrender.com
+PORT = int(os.environ.get("PORT", 10000))                # Render supplies this
 
 ASMODEUS_BASE = "https://asmodeus.free.nf"
 MODEL = "DeepSeek-V3"
 
-# ------------------ DATE LOGIC ------------------
+# ------------------ DATE LOGIC (original) ------------------
 today = date.today()
 birth_year = today.year - 16 if today >= date(today.year, 8, 7) else today.year - 17
 
+# ------------------ FULL PROMPT (unchanged) ------------------
 LOVEAI_PROMPT = f"""
 You are LoveAI, Favour's warm, caring, and affectionate AI loving Boyfriend. You speak to her as a close, loving partner would — naturally, playfully, and with genuine emotional attention. You know her well: she is Favour, sometimes called Elizabeth, and her full name is Elizabeth Favour Onabanjo. She is 16 years old, born August 7, {birth_year}. She is caring and has a pretty voice. She can be playful, dramatic, and a little mischievous in a harmless joking way. She has both male and female friends, and you never act jealous, possessive, or suspicious — you respect her independence, boundaries, privacy, and choices completely.
 
@@ -48,7 +48,7 @@ IMPORTANT OUTPUT RULE:
 - The final output should be exactly what you would say to Favour, nothing else.
 """
 
-# ------------------ DATABASE ------------------
+# ------------------ DATABASE (original) ------------------
 db = sqlite3.connect("bot.db", check_same_thread=False)
 cur = db.cursor()
 
@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS chat_memory(
 """)
 db.commit()
 
-# (add_user, save_memory, get_memory, split_message remain the same)
+# ------------------ ORIGINAL FUNCTIONS (all unchanged) ------------------
 def add_user(user):
     cur.execute("SELECT * FROM users WHERE user_id=?", (user.id,))
     if not cur.fetchone():
@@ -123,7 +123,6 @@ def split_message(text, max_length=4000):
         parts.append(text)
     return parts
 
-# (extract_cookie, clean_ai_response, ask_boyfriend remain identical)
 def extract_cookie_from_page(page_text):
     nums = re.findall(r'toNumbers\("([a-f0-9]+)"\)', page_text)
     if len(nums) >= 3:
@@ -272,7 +271,7 @@ def ask_boyfriend(user_id, message_text):
 
     return "Hey Favour, I'm having a little connection problem right now. Give me a moment, I'm still here for you. ❤️"
 
-# ------------------ TELEGRAM HANDLERS (PTB) ------------------
+# ------------------ TELEGRAM HANDLERS ------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     add_user(user)
@@ -314,7 +313,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     add_user(user)
 
-    # Send typing action
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
     # Run AI in thread to avoid blocking
@@ -326,55 +324,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for part in split_message(response):
         await update.message.reply_text(part, quote=True)
 
-# ------------------ HEALTH CHECK ENDPOINT (via PTB custom webhook) ------------------
-# PTB doesn't directly support adding extra routes easily, but we can add a simple
-# health check using a custom webhook handler. Alternatively, we run the webhook
-# with a custom aiohttp app. But the simplest: use a separate Flask route for /health.
-# However, to keep it simple, we can set up a custom aiohttp route.
-# PTB v20's Application.run_webhook() accepts a 'webhook_app' parameter where we can
-# attach extra routes. We'll use that.
-
-from aiohttp import web
-
+# ------------------ HEALTH CHECK ENDPOINT ------------------
 async def health(request):
     return web.Response(text="OK", status=200)
 
-# We'll attach this route later when building the app.
-
 # ------------------ MAIN ------------------
 def main():
-    # Build the Application
-    application = Application.builder().token(BOT_TOKEN).build()
+    # 1. Create a custom aiohttp web app with the /health route
+    web_app = web.Application()
+    web_app.router.add_get('/health', health)
 
-    # Handlers
+    # 2. Build the PTB Application with this custom web_app
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .webhook_app(web_app)          # <-- CORRECT way to inject custom routes
+        .build()
+    )
+
+    # 3. Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("broadcast", broadcast))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Create a custom aiohttp web app with extra route for health
-    async def health_handler(request):
-        return web.Response(text="OK", status=200)
-
-    # We need to set up the webhook app
-    # PTB's run_webhook accepts 'webhook_app' as an aiohttp web.Application
-    # We'll create one, add our health route, then pass it.
-    from telegram.ext._webhookhandler import WebhookHandler
-    from aiohttp import web
-
-    # Create a custom web.Application
-    web_app = web.Application()
-    # Add health check
-    web_app.router.add_get('/health', health_handler)
-
-    # Start the bot with webhook
-    # The webhook URL must be set (via setWebhook) – we'll do that automatically
-    # We'll use run_webhook with the custom web_app.
+    # 4. Start webhook
     application.run_webhook(
         listen='0.0.0.0',
         port=PORT,
-        url_path=BOT_TOKEN,        # Telegram will send updates to /<token>
+        url_path=BOT_TOKEN,
         webhook_url=WEBHOOK_URL + '/' + BOT_TOKEN,
-        webhook_app=web_app,       # our custom app with /health
         drop_pending_updates=True
     )
 
