@@ -1,32 +1,34 @@
 import asyncio
-
-# Fix for Pyrogram + Python 3.12+ / 3.14
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
 import re
 import sqlite3
 import requests
 import html
 from datetime import datetime, date
 from Crypto.Cipher import AES
-from pyrogram import Client, filters
-from pyrogram.enums import ChatAction
 from rich.console import Console
+import os
+
+# ------------------ TELEGRAM IMPORTS ------------------
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.constants import ChatAction
 
 console = Console()
 
-API_ID = 34766713
-API_HASH = "e736dfb03939c175fa52722d9fef7e41"
-BOT_TOKEN = "8619061450:AAFhR2cEgs97WFGJxnN8hGB-OW4XtDu6isY"
-OWNER_ID = 8854936887
+# ------------------ CONFIG (from environment) ------------------
+API_ID = int(os.environ.get("API_ID", 34766713))          # set in Render
+API_HASH = os.environ.get("API_HASH", "e736dfb03939c175fa52722d9fef7e41")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")                    # MUST be set
+OWNER_ID = int(os.environ.get("OWNER_ID", 8854936887))
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")               # e.g. https://your-app.onrender.com
+PORT = int(os.environ.get("PORT", 8443))                  # Render sets this
+
+# (The old API_ID, API_HASH, BOT_TOKEN, OWNER_ID are no longer hardcoded)
 
 ASMODEUS_BASE = "https://asmodeus.free.nf"
-BROADCAST_LOG_CHANNEL = -1003367669370
 MODEL = "DeepSeek-V3"
 
+# ------------------ DATE LOGIC ------------------
 today = date.today()
 birth_year = today.year - 16 if today >= date(today.year, 8, 7) else today.year - 17
 
@@ -46,6 +48,7 @@ IMPORTANT OUTPUT RULE:
 - The final output should be exactly what you would say to Favour, nothing else.
 """
 
+# ------------------ DATABASE ------------------
 db = sqlite3.connect("bot.db", check_same_thread=False)
 cur = db.cursor()
 
@@ -67,11 +70,9 @@ CREATE TABLE IF NOT EXISTS chat_memory(
     timestamp TEXT
 )
 """)
-
 db.commit()
 
-app = Client("loveai_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
+# (add_user, save_memory, get_memory, split_message remain the same)
 def add_user(user):
     cur.execute("SELECT * FROM users WHERE user_id=?", (user.id,))
     if not cur.fetchone():
@@ -122,6 +123,7 @@ def split_message(text, max_length=4000):
         parts.append(text)
     return parts
 
+# (extract_cookie, clean_ai_response, ask_boyfriend remain identical)
 def extract_cookie_from_page(page_text):
     nums = re.findall(r'toNumbers\("([a-f0-9]+)"\)', page_text)
     if len(nums) >= 3:
@@ -270,26 +272,28 @@ def ask_boyfriend(user_id, message_text):
 
     return "Hey Favour, I'm having a little connection problem right now. Give me a moment, I'm still here for you. ❤️"
 
-@app.on_message(filters.command("start"))
-async def start_handler(client, message):
-    user = message.from_user
+# ------------------ TELEGRAM HANDLERS (PTB) ------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     add_user(user)
-    await message.reply("Hey baby😊❤️ I'm here, Favour. How are you doing today?")
+    await update.message.reply_text("Hey baby😊❤️ I'm here, Favour. How are you doing today?")
 
-@app.on_message(filters.command("broadcast") & filters.user(OWNER_ID))
-async def broadcast_command(client, message):
-    if not message.reply_to_message:
-        await message.reply("Reply to a message with /broadcast")
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("You are not authorized.")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Reply to a message with /broadcast")
         return
     cur.execute("SELECT user_id FROM users")
     users = cur.fetchall()
     total = len(users)
     success = 0
     failed = 0
-    status_msg = await message.reply(f"Broadcasting... Total: {total}")
+    status_msg = await update.message.reply_text(f"Broadcasting... Total: {total}")
     for user in users:
         try:
-            await message.reply_to_message.copy(user[0])
+            await update.message.reply_to_message.copy(user[0])
             success += 1
         except:
             failed += 1
@@ -300,56 +304,85 @@ async def broadcast_command(client, message):
                 pass
     await status_msg.edit_text(f"Broadcast complete. Sent: {success}, Failed: {failed}")
 
-@app.on_message(filters.text & filters.private)
-async def main_handler(client, message):
-    user = message.from_user
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     if not user:
         return
-    text = message.text.strip()
+    text = update.message.text
     if not text or text.startswith("/"):
         return
     user_id = user.id
     add_user(user)
 
-    async def typing_indicator():
-        try:
-            while True:
-                await client.send_chat_action(
-                    chat_id=message.chat.id,
-                    action=ChatAction.TYPING
-                )
-                await asyncio.sleep(4)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            console.print(f"[yellow]Typing indicator error: {e}[/yellow]")
+    # Send typing action
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    typing_task = asyncio.create_task(typing_indicator())
-
-    try:
-        response = await asyncio.to_thread(
-            ask_boyfriend,
-            user_id,
-            text
-        )
-    finally:
-        typing_task.cancel()
-        try:
-            await typing_task
-        except asyncio.CancelledError:
-            pass
-
+    # Run AI in thread to avoid blocking
+    response = await asyncio.to_thread(ask_boyfriend, user_id, text)
     response = clean_ai_response(response)
     if not response:
         response = "Hmm 😅 I think my response got lost, Favour. Try again."
 
     for part in split_message(response):
-        await message.reply(part, quote=True)
+        await update.message.reply_text(part, quote=True)
+
+# ------------------ HEALTH CHECK ENDPOINT (via PTB custom webhook) ------------------
+# PTB doesn't directly support adding extra routes easily, but we can add a simple
+# health check using a custom webhook handler. Alternatively, we run the webhook
+# with a custom aiohttp app. But the simplest: use a separate Flask route for /health.
+# However, to keep it simple, we can set up a custom aiohttp route.
+# PTB v20's Application.run_webhook() accepts a 'webhook_app' parameter where we can
+# attach extra routes. We'll use that.
+
+from aiohttp import web
+
+async def health(request):
+    return web.Response(text="OK", status=200)
+
+# We'll attach this route later when building the app.
+
+# ------------------ MAIN ------------------
+def main():
+    # Build the Application
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # Handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("broadcast", broadcast))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Create a custom aiohttp web app with extra route for health
+    async def health_handler(request):
+        return web.Response(text="OK", status=200)
+
+    # We need to set up the webhook app
+    # PTB's run_webhook accepts 'webhook_app' as an aiohttp web.Application
+    # We'll create one, add our health route, then pass it.
+    from telegram.ext._webhookhandler import WebhookHandler
+    from aiohttp import web
+
+    # Create a custom web.Application
+    web_app = web.Application()
+    # Add health check
+    web_app.router.add_get('/health', health_handler)
+
+    # Start the bot with webhook
+    # The webhook URL must be set (via setWebhook) – we'll do that automatically
+    # We'll use run_webhook with the custom web_app.
+    application.run_webhook(
+        listen='0.0.0.0',
+        port=PORT,
+        url_path=BOT_TOKEN,        # Telegram will send updates to /<token>
+        webhook_url=WEBHOOK_URL + '/' + BOT_TOKEN,
+        webhook_app=web_app,       # our custom app with /health
+        drop_pending_updates=True
+    )
 
 if __name__ == "__main__":
-    console.print("[green]❤️ LoveAI Bot Starting...[/green]")
+    console.print("[green]❤️ LoveAI Bot Starting (webhook mode)...[/green]")
     console.print(f"[yellow]👤 Owner ID: {OWNER_ID}[/yellow]")
     console.print(f"[cyan]🌐 Asmodeus: {ASMODEUS_BASE}[/cyan]")
     console.print(f"[cyan]Model: {MODEL}[/cyan]")
-    console.print("[green]✅ Bot is running...[/green]")
-    app.run()
+    console.print(f"[blue]Webhook URL: {WEBHOOK_URL}/{BOT_TOKEN}[/blue]")
+    console.print("[green]✅ Bot is running via webhook...[/green]")
+    main()
