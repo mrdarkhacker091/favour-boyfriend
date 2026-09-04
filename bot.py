@@ -8,23 +8,17 @@ import random
 import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-
-from dotenv import load_dotenv
-
-# Load variables from .env
-load_dotenv()
-
 from Crypto.Cipher import AES
 from pyrogram import Client, filters
 from pyrogram.enums import ChatAction
 from rich.console import Console
 
 # ------------------ Environment & Constants ------------------
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-OWNER_ID = int(os.environ["OWNER_ID"])
-FAVOUR_USER_ID = int(os.environ["FAVOUR_USER_ID"])
+API_ID = 34766713
+API_HASH = "e736dfb03939c175fa52722d9fef7e41"
+BOT_TOKEN = "8619061450:AAFhR2cEgs97WFGJxnN8hGB-OW4XtDu6isY"
+OWNER_ID = 8854936887
+FAVOUR_USER_ID = 8854936887
 
 ASMODEUS_BASE = "https://asmodeus.free.nf"
 MODEL = "DeepSeek-V3"
