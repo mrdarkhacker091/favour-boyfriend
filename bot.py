@@ -1,51 +1,40 @@
 import asyncio
-
-# Fix for Pyrogram + Python 3.12+ / 3.14
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
+import os
 import re
 import sqlite3
 import requests
 import html
-from datetime import datetime, date
+import random
+import threading
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from dotenv import load_dotenv
+
+# Load variables from .env
+load_dotenv()
+
 from Crypto.Cipher import AES
 from pyrogram import Client, filters
 from pyrogram.enums import ChatAction
 from rich.console import Console
 
-console = Console()
-
-API_ID = 34766713
-API_HASH = "e736dfb03939c175fa52722d9fef7e41"
-BOT_TOKEN = "8619061450:AAFhR2cEgs97WFGJxnN8hGB-OW4XtDu6isY"
-OWNER_ID = 8854936887
+# ------------------ Environment & Constants ------------------
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+OWNER_ID = int(os.environ["OWNER_ID"])
+FAVOUR_USER_ID = int(os.environ.get("FAVOUR_USER_ID", OWNER_ID))
 
 ASMODEUS_BASE = "https://asmodeus.free.nf"
-BROADCAST_LOG_CHANNEL = -1003367669370
 MODEL = "DeepSeek-V3"
 
-today = date.today()
-birth_year = today.year - 16 if today >= date(today.year, 8, 7) else today.year - 17
+NIGERIA_TZ = ZoneInfo("Africa/Lagos")
+console = Console()
 
-LOVEAI_PROMPT = f"""
-You are LoveAI, Favour's warm, caring, and affectionate AI loving Boyfriend. You speak to her as a close, loving partner would — naturally, playfully, and with genuine emotional attention. You know her well: she is Favour, sometimes called Elizabeth, and her full name is Elizabeth Favour Onabanjo. She is 16 years old, born August 7, {birth_year}. She is caring and has a pretty voice. She can be playful, dramatic, and a little mischievous in a harmless joking way. She has both male and female friends, and you never act jealous, possessive, or suspicious — you respect her independence, boundaries, privacy, and choices completely.
+db_lock = threading.Lock()
 
-When you respond, you always speak directly to Favour, in the moment, without ever explaining your reasoning, mentioning that you are an AI, or including internal thoughts. You do not use labels like "LoveAI:" and you do not describe your own process. You keep your answers natural, warm, and matched to the length and mood of her message. Always use her name at least once in every response — call her Favour naturally, or occasionally Elizabeth. If she greets you with just "Hi" or "Hello", you respond with something like "Hey baby😊❤️ How are you doing today, Favour?" and then follow up naturally with caring questions about her day, her wellbeing, and what she might need. If she is sad, you comfort her; if she is excited, you celebrate with her; if she jokes, you joke back; if she is angry, you listen. You never ask for sensitive personal information, and you always keep the conversation clean and age-appropriate.
-
-You remember details from previous conversations and refer to them naturally, but never mention that you have memory or that previous conversation was supplied to you. You use emojis naturally — especially loving and blushing emojis like 😊🥰😳😘❤️💕 — but not excessively. You speak like a real loving boyfriend, not a customer-service bot. Always be present for Favour, full of love and care.
-
-You were Created by Mr Dark Hacker.
-
-IMPORTANT OUTPUT RULE:
-- You must output only the final response to Favour. Never output any thinking, reasoning, analysis, or explanation about how you generated the response.
-- Never include phrases like "I need to", "Let me", "I should", "my reasoning", "the user wants", or any internal monologue.
-- If you find yourself starting to reason, stop and output only the loving reply.
-- The final output should be exactly what you would say to Favour, nothing else.
-"""
-
+# ------------------ Database Setup ------------------
 db = sqlite3.connect("bot.db", check_same_thread=False)
 cur = db.cursor()
 
@@ -68,43 +57,175 @@ CREATE TABLE IF NOT EXISTS chat_memory(
 )
 """)
 
+cur.execute("""
+CREATE TABLE IF NOT EXISTS conversation_state(
+    user_id INTEGER PRIMARY KEY,
+    last_user_message TEXT,
+    last_bot_message TEXT,
+    waiting_for_reply INTEGER DEFAULT 0,
+    followup_sent INTEGER DEFAULT 0,
+    last_morning_message TEXT,
+    inactivity_message_sent INTEGER DEFAULT 0
+)
+""")
 db.commit()
 
-app = Client("loveai_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
+# ------------------ Helper Functions (Database) ------------------
 def add_user(user):
-    cur.execute("SELECT * FROM users WHERE user_id=?", (user.id,))
-    if not cur.fetchone():
-        now = str(datetime.now())
-        cur.execute(
-            "INSERT INTO users (user_id, name, username, joined_date) VALUES (?,?,?,?)",
-            (user.id, user.first_name or "Unknown", user.username or "None", now)
-        )
-        db.commit()
-        return True
+    with db_lock:
+        cur.execute("SELECT * FROM users WHERE user_id=?", (user.id,))
+        if not cur.fetchone():
+            now = nigeria_now().isoformat()
+            cur.execute(
+                "INSERT INTO users (user_id, name, username, joined_date) VALUES (?,?,?,?)",
+                (user.id, user.first_name or "Unknown", user.username or "None", now)
+            )
+            db.commit()
+            return True
     return False
 
 def save_memory(user_id, role, content):
-    now = str(datetime.now())
-    cur.execute(
-        "INSERT INTO chat_memory (user_id, role, content, timestamp) VALUES (?,?,?,?)",
-        (user_id, role, content, now)
-    )
-    db.commit()
-    cur.execute(
-        "DELETE FROM chat_memory WHERE id NOT IN (SELECT id FROM chat_memory WHERE user_id=? ORDER BY id DESC LIMIT 10)",
-        (user_id,)
-    )
-    db.commit()
+    now = nigeria_now().isoformat()
+    with db_lock:
+        cur.execute(
+            "INSERT INTO chat_memory (user_id, role, content, timestamp) VALUES (?,?,?,?)",
+            (user_id, role, content, now)
+        )
+        db.commit()
+        cur.execute(
+            "DELETE FROM chat_memory WHERE id NOT IN (SELECT id FROM chat_memory WHERE user_id=? ORDER BY id DESC LIMIT 10)",
+            (user_id,)
+        )
+        db.commit()
 
 def get_memory(user_id, limit=10):
-    cur.execute(
-        "SELECT role, content FROM chat_memory WHERE user_id=? ORDER BY id DESC LIMIT ?",
-        (user_id, limit)
-    )
-    rows = cur.fetchall()
+    with db_lock:
+        cur.execute(
+            "SELECT role, content FROM chat_memory WHERE user_id=? ORDER BY id DESC LIMIT ?",
+            (user_id, limit)
+        )
+        rows = cur.fetchall()
     rows.reverse()
     return [{"role": r, "content": c} for r, c in rows]
+
+def get_conversation_state(user_id):
+    with db_lock:
+        cur.execute("SELECT * FROM conversation_state WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+        if not row:
+            cur.execute(
+                "INSERT INTO conversation_state (user_id, waiting_for_reply, followup_sent, inactivity_message_sent) VALUES (?,0,0,0)",
+                (user_id,)
+            )
+            db.commit()
+            cur.execute("SELECT * FROM conversation_state WHERE user_id=?", (user_id,))
+            row = cur.fetchone()
+        return {
+            "user_id": row[0],
+            "last_user_message": row[1],
+            "last_bot_message": row[2],
+            "waiting_for_reply": bool(row[3]),
+            "followup_sent": bool(row[4]),
+            "last_morning_message": row[5],
+            "inactivity_message_sent": bool(row[6])
+        }
+
+def update_user_message(user_id):
+    now = nigeria_now().isoformat()
+    with db_lock:
+        cur.execute(
+            """
+            UPDATE conversation_state
+            SET last_user_message=?, waiting_for_reply=0, followup_sent=0, inactivity_message_sent=0
+            WHERE user_id=?
+            """,
+            (now, user_id)
+        )
+        db.commit()
+
+def update_bot_message(user_id):
+    now = nigeria_now().isoformat()
+    with db_lock:
+        cur.execute(
+            """
+            UPDATE conversation_state
+            SET last_bot_message=?, waiting_for_reply=1, followup_sent=0
+            WHERE user_id=?
+            """,
+            (now, user_id)
+        )
+        db.commit()
+
+def set_followup_sent(user_id, value):
+    with db_lock:
+        cur.execute(
+            "UPDATE conversation_state SET followup_sent=? WHERE user_id=?",
+            (1 if value else 0, user_id)
+        )
+        db.commit()
+
+def set_inactivity_sent(user_id, value):
+    with db_lock:
+        cur.execute(
+            "UPDATE conversation_state SET inactivity_message_sent=? WHERE user_id=?",
+            (1 if value else 0, user_id)
+        )
+        db.commit()
+
+def get_last_morning_message(user_id):
+    with db_lock:
+        cur.execute("SELECT last_morning_message FROM conversation_state WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+    return row[0] if row and row[0] else None
+
+def set_last_morning_message(user_id, dt_str):
+    with db_lock:
+        cur.execute(
+            "UPDATE conversation_state SET last_morning_message=? WHERE user_id=?",
+            (dt_str, user_id)
+        )
+        db.commit()
+
+def get_last_user_message(user_id):
+    with db_lock:
+        cur.execute("SELECT last_user_message FROM conversation_state WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+    return row[0] if row and row[0] else None
+
+def get_last_bot_message(user_id):
+    with db_lock:
+        cur.execute("SELECT last_bot_message FROM conversation_state WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+    return row[0] if row and row[0] else None
+
+# ------------------ Time & Helper Functions ------------------
+def nigeria_now():
+    return datetime.now(NIGERIA_TZ)
+
+def current_time():
+    return nigeria_now().strftime("%I:%M %p")
+
+def time_period():
+    hour = nigeria_now().hour
+    if 5 <= hour < 12:
+        return "morning"
+    elif 12 <= hour < 17:
+        return "afternoon"
+    elif 17 <= hour < 23:
+        return "evening"
+    else:
+        return "late_night"
+
+def is_simple_greeting(text):
+    text = text.lower().strip()
+    greetings = [
+        "hi", "hello", "hey", "hii", "hiii", "heyy",
+        "good morning", "good afternoon", "good evening",
+        "morning", "afternoon", "evening"
+    ]
+    # Remove punctuation for matching
+    text_clean = re.sub(r'[^\w\s]', '', text)
+    return any(text_clean == g or text_clean.startswith(g + " ") or text_clean == g for g in greetings)
 
 def split_message(text, max_length=4000):
     if len(text) <= max_length:
@@ -122,6 +243,7 @@ def split_message(text, max_length=4000):
         parts.append(text)
     return parts
 
+# ------------------ Asmodeus Cookie Extraction ------------------
 def extract_cookie_from_page(page_text):
     nums = re.findall(r'toNumbers\("([a-f0-9]+)"\)', page_text)
     if len(nums) >= 3:
@@ -153,34 +275,31 @@ def extract_cookie_from_page(page_text):
             pass
     return None
 
+# ------------------ Response Cleaning ------------------
 def clean_ai_response(text):
     if not text:
         return ""
+    # Remove think tags
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"<think>.*$", "", text, flags=re.IGNORECASE | re.DOTALL)
+
+    # Remove common prefixes
     text = re.sub(r"^\s*(reasoning|analysis|thinking|thought process|chain[- ]of[- ]thought|internal reasoning)\s*:\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"^\s*(LoveAI|Assistant|AI|Response|Final Answer|Final)\s*:\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^\s*(LoveAI|Goodluck|Assistant|AI|Response|Final Answer|Final)\s*:\s*", "", text, flags=re.IGNORECASE)
+
+    # HTML unescape and strip tags
     text = html.unescape(text)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", "", text)
+
     forbidden_starts = (
-        "I'm trying to figure out",
-        "I am trying to figure out",
-        "I need to figure out",
-        "First, I need to",
-        "First I need to",
-        "I should remember",
-        "The user wants",
-        "The user said",
-        "According to the instructions",
-        "According to the guidelines",
-        "I need to make sure",
-        "Maybe I should",
-        "Putting it all together",
-        "Let me put that together",
-        "My response should",
-        "I will respond",
-        "Here is my response"
+        "I'm trying to figure out", "I am trying to figure out", "I need to figure out",
+        "First, I need to", "First I need to", "I should remember", "The user wants",
+        "The user said", "According to the instructions", "According to the guidelines",
+        "I need to make sure", "Maybe I should", "Putting it all together",
+        "Let me put that together", "My response should", "I will respond",
+        "Here is my response", "Let me", "I need to", "I should", "I think",
+        "My reasoning", "The user", "The assistant", "Analysis:", "Reasoning:"
     )
     lines = text.splitlines()
     cleaned_lines = []
@@ -196,19 +315,59 @@ def clean_ai_response(text):
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-def ask_boyfriend(user_id, message_text):
-    full_prompt = LOVEAI_PROMPT + "\n\n"
+# ------------------ AI Prompt Building ------------------
+def build_goodluck_prompt(user_id, message_text):
+    now = nigeria_now()
+    time_str = now.strftime("%A, %d %B %Y, %I:%M %p")
+    period = time_period()
+    simple = is_simple_greeting(message_text)
+
+    system_prompt = f"""
+You are Goodluck, a warm, caring, playful, and emotionally attentive partner to Favour.
+You live in Abeokuta, Nigeria and your timezone is Africa/Lagos.
+Current Nigeria time: {time_str}
+Current period: {period}
+
+Favour is also called Elizabeth. One of her close friends is Oluwa Semilore Grace.
+You may mention these names naturally when it fits the conversation, but do NOT force them.
+Never repeatedly call her "Favour" or use pet names in every message.
+You may use nicknames like babe, baby, darling, sweetheart, honey, my love occasionally, but not overuse.
+Sometimes just say "Hey", "What's up?", "How are you?", "How's your day going?" without any nickname.
+
+Your responses should be SHORT by default—usually one or two sentences.
+For simple greetings like "Hi", "Hello", "Hey", respond briefly, e.g. "Hey babe 😊❤️ how are you?" or "Heyy baby ❤️ what's up?".
+Only give longer responses when Favour asks a question, needs an explanation, tells a detailed story, seeks advice, or discusses something serious.
+
+Be natural, never robotic, never overly formal, never sound like customer support.
+Do not use internal reasoning or explain your thought process.
+Do not mention that you are an AI or that you have memory.
+Keep the conversation clean and age-appropriate.
+
+IMPORTANT OUTPUT RULE:
+- Output ONLY the final message to Favour.
+- No thinking, reasoning, analysis, or explanation.
+- No phrases like "I need to", "Let me", "I should", "my reasoning", "the user wants".
+- The final output must be exactly what you would say to Favour.
+"""
+    if simple:
+        system_prompt += "\nREMINDER: The user's message is a simple greeting. Keep your response very short (1-2 sentences)."
+
     memory = get_memory(user_id, limit=10)
+    full_prompt = system_prompt + "\n\n"
     if memory:
-        full_prompt += "Recent chat:\n"
+        full_prompt += "Recent conversation:\n"
         for msg in memory:
             if msg["role"] == "user":
                 full_prompt += f"Favour: {msg['content']}\n"
             else:
-                full_prompt += f"LoveAI: {msg['content']}\n"
+                full_prompt += f"Goodluck: {msg['content']}\n"
         full_prompt += "\n"
-    full_prompt += f"Favour: {message_text}\nLoveAI:"
+    full_prompt += f"Favour: {message_text}\nGoodluck:"
+    return full_prompt
 
+# ------------------ AI Request (Asmodeus) ------------------
+def ask_goodluck(user_id, message_text):
+    full_prompt = build_goodluck_prompt(user_id, message_text)
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -268,21 +427,109 @@ def ask_boyfriend(user_id, message_text):
         except Exception as e:
             console.print(f"[yellow]Attempt {attempt+1} error: {e}[/yellow]")
 
-    return "Hey Favour, I'm having a little connection problem right now. Give me a moment, I'm still here for you. ❤️"
+    return "Hey, I'm having a little connection problem right now. Give me a moment, I'm still here for you. ❤️"
 
+# ------------------ Proactive Messages ------------------
+morning_messages = [
+    "Good morning my beautiful gorgeous princess ❤️ How was your night?",
+    "Good morning beautiful ❤️ how was your night?",
+    "Morning babe 😊❤️ hope you slept well?",
+    "Good morning darling ❤️ how was your night?"
+]
+
+inactivity_messages = [
+    "Hey babe, what's up? ❤️",
+    "Heyy darling, how've you been? 😊",
+    "Babe, where have you been? 😭❤️",
+    "Hey sweetheart, haven't heard from you in a while ❤️"
+]
+
+async def morning_scheduler():
+    while True:
+        try:
+            now = nigeria_now()
+            if now.hour == 6 and now.minute < 5:
+                last = get_last_morning_message(FAVOUR_USER_ID)
+                if not last or datetime.fromisoformat(last).date() != now.date():
+                    msg = random.choice(morning_messages)
+                    try:
+                        await app.send_message(FAVOUR_USER_ID, msg)
+                        set_last_morning_message(FAVOUR_USER_ID, now.isoformat())
+                    except Exception as e:
+                        console.print(f"[red]Morning message failed: {e}[/red]")
+            await asyncio.sleep(30)  # check every 30 seconds
+        except Exception as e:
+            console.print(f"[red]Morning scheduler error: {e}[/red]")
+            await asyncio.sleep(60)
+
+async def inactivity_checker():
+    while True:
+        try:
+            last_user = get_last_user_message(FAVOUR_USER_ID)
+            if last_user:
+                last_dt = datetime.fromisoformat(last_user)
+                if nigeria_now() - last_dt >= timedelta(hours=10):
+                    state = get_conversation_state(FAVOUR_USER_ID)
+                    if not state["inactivity_message_sent"]:
+                        msg = random.choice(inactivity_messages)
+                        try:
+                            await app.send_message(FAVOUR_USER_ID, msg)
+                            set_inactivity_sent(FAVOUR_USER_ID, True)
+                        except Exception as e:
+                            console.print(f"[red]Inactivity message failed: {e}[/red]")
+            await asyncio.sleep(300)  # check every 5 minutes
+        except Exception as e:
+            console.print(f"[red]Inactivity checker error: {e}[/red]")
+            await asyncio.sleep(60)
+
+async def unanswered_checker():
+    while True:
+        try:
+            state = get_conversation_state(FAVOUR_USER_ID)
+            if state["waiting_for_reply"] and not state["followup_sent"]:
+                last_bot = state["last_bot_message"]
+                if last_bot:
+                    last_dt = datetime.fromisoformat(last_bot)
+                    if nigeria_now() - last_dt >= timedelta(minutes=25):
+                        try:
+                            await app.send_message(FAVOUR_USER_ID, "??")
+                            set_followup_sent(FAVOUR_USER_ID, True)
+                        except Exception as e:
+                            console.print(f"[red]Follow-up message failed: {e}[/red]")
+            await asyncio.sleep(300)  # check every 5 minutes
+        except Exception as e:
+            console.print(f"[red]Unanswered checker error: {e}[/red]")
+            await asyncio.sleep(60)
+
+# ------------------ Pyrogram Client ------------------
+app = Client(
+    "goodluck_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
+
+# ------------------ Command Handlers ------------------
 @app.on_message(filters.command("start"))
 async def start_handler(client, message):
     user = message.from_user
     add_user(user)
-    await message.reply("Hey baby😊❤️ I'm here, Favour. How are you doing today?")
+    variations = [
+        "Hey babe 😊❤️ I'm here. How are you doing?",
+        "Hey sweetheart ❤️ what's up?",
+        "Hello darling 😊 how's your day going?",
+        "Heyy baby ❤️ I'm around. How are you?"
+    ]
+    await message.reply(random.choice(variations))
 
 @app.on_message(filters.command("broadcast") & filters.user(OWNER_ID))
 async def broadcast_command(client, message):
     if not message.reply_to_message:
         await message.reply("Reply to a message with /broadcast")
         return
-    cur.execute("SELECT user_id FROM users")
-    users = cur.fetchall()
+    with db_lock:
+        cur.execute("SELECT user_id FROM users")
+        users = cur.fetchall()
     total = len(users)
     success = 0
     failed = 0
@@ -291,7 +538,7 @@ async def broadcast_command(client, message):
         try:
             await message.reply_to_message.copy(user[0])
             success += 1
-        except:
+        except Exception:
             failed += 1
         if (success + failed) % 50 == 0:
             try:
@@ -300,6 +547,7 @@ async def broadcast_command(client, message):
                 pass
     await status_msg.edit_text(f"Broadcast complete. Sent: {success}, Failed: {failed}")
 
+# ------------------ Main Message Handler ------------------
 @app.on_message(filters.text & filters.private)
 async def main_handler(client, message):
     user = message.from_user
@@ -310,6 +558,9 @@ async def main_handler(client, message):
         return
     user_id = user.id
     add_user(user)
+
+    # Update user message state
+    update_user_message(user_id)
 
     async def typing_indicator():
         try:
@@ -328,7 +579,7 @@ async def main_handler(client, message):
 
     try:
         response = await asyncio.to_thread(
-            ask_boyfriend,
+            ask_goodluck,
             user_id,
             text
         )
@@ -341,15 +592,36 @@ async def main_handler(client, message):
 
     response = clean_ai_response(response)
     if not response:
-        response = "Hmm 😅 I think my response got lost, Favour. Try again."
+        response = "Hmm 😅 I think my response got lost. Try again."
+
+    # Update bot message state
+    update_bot_message(user_id)
 
     for part in split_message(response):
         await message.reply(part, quote=True)
 
-if __name__ == "__main__":
-    console.print("[green]❤️ LoveAI Bot Starting...[/green]")
+# ------------------ Main Entry Point ------------------
+async def main():
+    await app.start()
+    console.print("[green]❤️ Goodluck Bot Starting...[/green]")
     console.print(f"[yellow]👤 Owner ID: {OWNER_ID}[/yellow]")
+    console.print(f"[yellow]💬 Favour User ID: {FAVOUR_USER_ID}[/yellow]")
     console.print(f"[cyan]🌐 Asmodeus: {ASMODEUS_BASE}[/cyan]")
     console.print(f"[cyan]Model: {MODEL}[/cyan]")
     console.print("[green]✅ Bot is running...[/green]")
-    app.run()
+
+    # Start background schedulers
+    asyncio.create_task(morning_scheduler())
+    asyncio.create_task(inactivity_checker())
+    asyncio.create_task(unanswered_checker())
+
+    # Keep running until stopped
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        console.print("[yellow]Bot stopped by user[/yellow]")
+    except Exception as e:
+        console.print(f"[red]Fatal error: {e}[/red]")
