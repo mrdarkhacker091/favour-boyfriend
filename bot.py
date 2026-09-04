@@ -24,7 +24,7 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])
-FAVOUR_USER_ID = int(os.environ.get("FAVOUR_USER_ID", OWNER_ID))
+FAVOUR_USER_ID = int(os.environ["FAVOUR_USER_ID"])
 
 ASMODEUS_BASE = "https://asmodeus.free.nf"
 MODEL = "DeepSeek-V3"
