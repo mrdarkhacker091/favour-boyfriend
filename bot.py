@@ -1,11 +1,5 @@
 import asyncio
-
-# Fix for Pyrogram + Python 3.12+ / 3.14
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
+import os
 import re
 import sqlite3
 import requests
@@ -16,11 +10,11 @@ import traceback
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from Crypto.Cipher import AES
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 from pyrogram.enums import ChatAction
 from rich.console import Console
 
-# ------------------ Hardcoded Credentials (as per your request) ------------------
+# ------------------ Hardcoded Credentials ------------------
 API_ID = 34766713
 API_HASH = "e736dfb03939c175fa52722d9fef7e41"
 BOT_TOKEN = "8619061450:AAFhR2cEgs97WFGJxnN8hGB-OW4XtDu6isY"
@@ -29,6 +23,11 @@ FAVOUR_USER_ID = 8854936887
 
 ASMODEUS_BASE = "https://asmodeus.free.nf"
 MODEL = "DeepSeek-V3"
+
+# ------------------ Groq Configuration ------------------
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = "openai/gpt-oss-120b"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 NIGERIA_TZ = ZoneInfo("Africa/Lagos")
 console = Console()
@@ -295,12 +294,13 @@ def extract_cookie_from_page(page_text):
 def clean_ai_response(text):
     if not text:
         return ""
+    # Remove think tags
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"<think>.*$", "", text, flags=re.IGNORECASE | re.DOTALL)
-
+    # Remove common prefixes
     text = re.sub(r"^\s*(reasoning|analysis|thinking|thought process|chain[- ]of[- ]thought|internal reasoning)\s*:\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"^\s*(LoveAI|Goodluck|Assistant|AI|Response|Final Answer|Final)\s*:\s*", "", text, flags=re.IGNORECASE)
-
+    # HTML unescape and strip tags
     text = html.unescape(text)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", "", text)
@@ -328,8 +328,84 @@ def clean_ai_response(text):
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-# ------------------ AI Prompt Building ------------------
-def build_goodluck_prompt(user_id, message_text):
+# ------------------ AI Prompt Building (for Groq) ------------------
+def build_groq_messages(user_id, message_text):
+    # System prompt with time and personality
+    now = nigeria_now()
+    time_str = now.strftime("%A, %d %B %Y, %I:%M %p")
+    period = time_period()
+    simple = is_simple_greeting(message_text)
+
+    system_prompt = f"""
+You are Goodluck, a warm, caring, playful, and emotionally attentive partner to Favour.
+You live in Abeokuta, Nigeria and your timezone is Africa/Lagos.
+Current Nigeria time: {time_str}
+Current period: {period}
+
+Favour is also called Elizabeth. One of her close friends is Oluwa Semilore Grace.
+You may mention these names naturally when it fits the conversation, but do NOT force them.
+Never repeatedly call her "Favour" or use pet names in every message.
+You may use nicknames like babe, baby, darling, sweetheart, honey, my love occasionally, but not overuse.
+Sometimes just say "Hey", "What's up?", "How are you?", "How's your day going?" without any nickname.
+
+Your responses should be SHORT by default—usually one or two sentences.
+For simple greetings like "Hi", "Hello", "Hey", respond briefly, e.g. "Hey babe 😊❤️ how are you?" or "Heyy baby ❤️ what's up?".
+Only give longer responses when Favour asks a question, needs an explanation, tells a detailed story, seeks advice, or discusses something serious.
+
+Be natural, never robotic, never overly formal, never sound like customer support.
+Do not use internal reasoning or explain your thought process.
+Do not mention that you are an AI or that you have memory.
+Keep the conversation clean and age-appropriate.
+"""
+    if simple:
+        system_prompt += "\nREMINDER: The user's message is a simple greeting. Keep your response very short (1-2 sentences)."
+
+    messages = [{"role": "system", "content": system_prompt}]
+
+    memory = get_memory(user_id, limit=10)
+    if memory:
+        for msg in memory:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+
+    messages.append({"role": "user", "content": message_text})
+    return messages
+
+# ------------------ Groq AI Request ------------------
+def ask_groq(user_id, message_text):
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is not set")
+
+    messages = build_groq_messages(user_id, message_text)
+
+    response = requests.post(
+        GROQ_URL,
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": GROQ_MODEL,
+            "messages": messages,
+            "temperature": 0.8,
+            "max_completion_tokens": 300
+        },
+        timeout=45
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(f"Groq HTTP {response.status_code}: {response.text[:500]}")
+
+    data = response.json()
+    answer = data["choices"][0]["message"]["content"]
+    answer = clean_ai_response(answer)
+    if not answer:
+        raise RuntimeError("Groq returned an empty response")
+    return answer
+
+# ------------------ Asmodeus AI Request (Fallback) ------------------
+def ask_asmodeus(user_id, message_text):
+    # Reuse the existing Asmodeus request logic, but as a standalone function.
+    # Build prompt using Goodluck system prompt and memory.
     now = nigeria_now()
     time_str = now.strftime("%A, %d %B %Y, %I:%M %p")
     period = time_period()
@@ -376,14 +452,7 @@ IMPORTANT OUTPUT RULE:
                 full_prompt += f"Goodluck: {msg['content']}\n"
         full_prompt += "\n"
     full_prompt += f"Favour: {message_text}\nGoodluck:"
-    return full_prompt
 
-# ------------------ AI Request (Asmodeus) ------------------
-def ask_goodluck(user_id, message_text):
-    console.print(f"[cyan]🌐 Requesting AI response for user {user_id}...[/cyan]")
-    full_prompt = build_goodluck_prompt(user_id, message_text)
-
-    console.print("[cyan]🌐 Connecting to Asmodeus...[/cyan]")
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -396,21 +465,16 @@ def ask_goodluck(user_id, message_text):
 
     for attempt in range(3):
         try:
-            console.print(f"[cyan]🍪 Checking session (attempt {attempt + 1})...[/cyan]")
             page = session.get(ASMODEUS_BASE + "/", timeout=30, allow_redirects=True)
-
             if "response-content" not in page.text and "deepseek.php" not in page.text:
                 cookie = extract_cookie_from_page(page.text)
                 if not cookie:
-                    console.print("[yellow]Cookie extraction failed[/yellow]")
                     continue
                 session.cookies.set("__test", cookie, domain="asmodeus.free.nf", path="/")
                 verify = session.get(ASMODEUS_BASE + "/index.php?i=1", timeout=30)
                 if verify.status_code != 200:
-                    console.print("[yellow]Cookie verification failed[/yellow]")
                     continue
 
-            console.print("[cyan]📡 Sending DeepSeek-V3 request...[/cyan]")
             response = session.post(
                 ASMODEUS_BASE + "/deepseek.php",
                 params={"i": "1"},
@@ -423,19 +487,13 @@ def ask_goodluck(user_id, message_text):
                     "Referer": ASMODEUS_BASE + "/"
                 }
             )
-            console.print(f"[cyan]📥 HTTP status: {response.status_code}[/cyan]")
 
-            console.print("[cyan]🧠 Parsing response...[/cyan]")
             match = re.search(r'<div class="response-content">(.*?)</div>', response.text, re.DOTALL | re.IGNORECASE)
             if match:
                 answer = clean_ai_response(match.group(1))
                 if answer and len(answer) > 1:
-                    save_memory(user_id, "user", message_text)
-                    save_memory(user_id, "assistant", answer)
-                    console.print("[green]✅ Response parsed successfully[/green]")
                     return answer
 
-            console.print("[yellow]⚠️ Primary parse failed, trying fallback...[/yellow]")
             fallback = re.sub(r'<script\b[^<]*(?:(?!</script>)<[^<]*)*</script>', '', response.text, flags=re.DOTALL | re.IGNORECASE)
             fallback = re.sub(r'<style\b[^<]*(?:(?!</style>)<[^<]*)*</style>', '', fallback, flags=re.DOTALL | re.IGNORECASE)
             fallback = re.sub(r'<[^>]+>', ' ', fallback)
@@ -443,16 +501,38 @@ def ask_goodluck(user_id, message_text):
             fallback = clean_ai_response(fallback)
             fallback = re.sub(r'\s+', ' ', fallback).strip()
             if fallback and len(fallback) > 20 and "error" not in fallback.lower():
-                save_memory(user_id, "user", message_text)
-                save_memory(user_id, "assistant", fallback)
-                console.print("[green]✅ Fallback response saved.[/green]")
                 return fallback
-
         except Exception as e:
-            console.print(f"[red]❌ Asmodeus error: {e}[/red]")
-            console.print(traceback.format_exc())
+            console.print(f"[yellow]Asmodeus attempt {attempt+1} error: {e}[/yellow]")
 
-    console.print("[red]❌ AI request failed after 3 attempts.[/red]")
+    raise RuntimeError("Asmodeus failed after 3 attempts")
+
+# ------------------ Unified AI Request (Groq primary, Asmodeus fallback) ------------------
+def ask_goodluck(user_id, message_text):
+    # Try Groq first
+    try:
+        console.print("[cyan]⚡ Trying Groq...[/cyan]")
+        answer = ask_groq(user_id, message_text)
+        save_memory(user_id, "user", message_text)
+        save_memory(user_id, "assistant", answer)
+        console.print("[green]✅ Groq response received[/green]")
+        return answer
+    except Exception as e:
+        console.print(f"[yellow]⚠️ Groq failed: {e}[/yellow]")
+
+    # Fallback to Asmodeus
+    try:
+        console.print("[cyan]🔄 Falling back to Asmodeus...[/cyan]")
+        answer = ask_asmodeus(user_id, message_text)
+        save_memory(user_id, "user", message_text)
+        save_memory(user_id, "assistant", answer)
+        console.print("[green]✅ Asmodeus response received[/green]")
+        return answer
+    except Exception as e:
+        console.print(f"[yellow]⚠️ Asmodeus failed: {e}[/yellow]")
+
+    # Both failed
+    console.print("[red]❌ All AI providers failed[/red]")
     return "Hey, I'm having a little connection problem right now. Give me a moment, I'm still here for you. ❤️"
 
 # ------------------ Proactive Messages ------------------
@@ -584,16 +664,16 @@ async def main_handler(client, message):
         console.print(f"[blue]📩 Message received: {message.text}[/blue]")
         user = message.from_user
         if not user or user.is_bot:
-            return
-        if not user:
-            console.print("[red]❌ No user in message.[/red]")
+            console.print("[yellow]⚠️ Ignoring message from bot or missing user[/yellow]")
             return
         text = (message.text or "").strip()
         if not text or text.startswith("/"):
             console.print("[yellow]⚠️ Ignoring command or empty message[/yellow]")
             return
+
         user_id = user.id
         console.print(f"[blue]👤 User ID: {user_id}[/blue]")
+
         add_user(user)
         ensure_conversation_state(user_id)
         update_user_message(user_id)
@@ -611,7 +691,6 @@ async def main_handler(client, message):
         typing_task = asyncio.create_task(typing_loop(message.chat.id))
         try:
             console.print("[blue]🧠 Generating response...[/blue]")
-            console.print("[blue]🌐 Sending request to Asmodeus...[/blue]")
             response = await asyncio.to_thread(ask_goodluck, user_id, text)
             console.print("[green]✅ AI response received[/green]")
             response = clean_ai_response(response)
@@ -648,7 +727,8 @@ async def main():
     console.print(f"[yellow]👤 Owner ID: {OWNER_ID}[/yellow]")
     console.print(f"[yellow]💬 Favour User ID: {FAVOUR_USER_ID}[/yellow]")
     console.print(f"[cyan]🌐 Asmodeus: {ASMODEUS_BASE}[/cyan]")
-    console.print(f"[cyan]Model: {MODEL}[/cyan]")
+    console.print(f"[cyan]Model (fallback): {MODEL}[/cyan]")
+    console.print(f"[cyan]⚡ Groq model: {GROQ_MODEL} (primary)[/cyan]")
     console.print("[green]✅ Bot is running...[/green]")
     console.print("[green]📋 Handlers registered. Waiting for updates...[/green]")
 
@@ -660,7 +740,7 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        app.run(main())
+        asyncio.run(main())
     except KeyboardInterrupt:
         console.print("[yellow]Bot stopped by user[/yellow]")
     except Exception as e:
