@@ -25,8 +25,8 @@ ASMODEUS_BASE = "https://asmodeus.free.nf"
 MODEL = "DeepSeek-V3"
 
 # ------------------ Groq Configuration ------------------
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = "openai/gpt-oss-120b"
+GROQ_API_KEY = "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"
+GROQ_MODEL = "openai/gpt-oss-safeguard-20b"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 NIGERIA_TZ = ZoneInfo("Africa/Lagos")
@@ -92,7 +92,7 @@ def save_memory(user_id, role, content):
             (user_id, role, content, now)
         )
         db.commit()
-        # FIXED: user-scoped deletion so we never delete other users' memory
+        # User‑scoped deletion so we never delete other users' memory
         cur.execute(
             "DELETE FROM chat_memory WHERE user_id=? AND id NOT IN (SELECT id FROM chat_memory WHERE user_id=? ORDER BY id DESC LIMIT 10)",
             (user_id, user_id)
@@ -330,7 +330,6 @@ def clean_ai_response(text):
 
 # ------------------ AI Prompt Building (for Groq) ------------------
 def build_groq_messages(user_id, message_text):
-    # System prompt with time and personality
     now = nigeria_now()
     time_str = now.strftime("%A, %d %B %Y, %I:%M %p")
     period = time_period()
@@ -404,8 +403,6 @@ def ask_groq(user_id, message_text):
 
 # ------------------ Asmodeus AI Request (Fallback) ------------------
 def ask_asmodeus(user_id, message_text):
-    # Reuse the existing Asmodeus request logic, but as a standalone function.
-    # Build prompt using Goodluck system prompt and memory.
     now = nigeria_now()
     time_str = now.strftime("%A, %d %B %Y, %I:%M %p")
     period = time_period()
@@ -507,7 +504,7 @@ IMPORTANT OUTPUT RULE:
 
     raise RuntimeError("Asmodeus failed after 3 attempts")
 
-# ------------------ Unified AI Request (Groq primary, Asmodeus fallback) ------------------
+# ------------------ Unified AI Request ------------------
 def ask_goodluck(user_id, message_text):
     # Try Groq first
     try:
@@ -718,11 +715,8 @@ async def main_handler(client, message):
         console.print(f"[red]❌ CRITICAL handler error: {outer_e}[/red]")
         console.print(traceback.format_exc())
 
-# ------------------ Main Entry Point ------------------
-async def main():
-    await app.start()
-    me = await app.get_me()
-    console.print(f"[green]✅ Logged in as @{me.username} (ID: {me.id})[/green]")
+# ------------------ Start the Bot ------------------
+if __name__ == "__main__":
     console.print("[green]❤️ Goodluck Bot Starting...[/green]")
     console.print(f"[yellow]👤 Owner ID: {OWNER_ID}[/yellow]")
     console.print(f"[yellow]💬 Favour User ID: {FAVOUR_USER_ID}[/yellow]")
@@ -732,17 +726,4 @@ async def main():
     console.print("[green]✅ Bot is running...[/green]")
     console.print("[green]📋 Handlers registered. Waiting for updates...[/green]")
 
-    asyncio.create_task(morning_scheduler())
-    asyncio.create_task(inactivity_checker())
-    asyncio.create_task(unanswered_checker())
-
-    await asyncio.Event().wait()
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        console.print("[yellow]Bot stopped by user[/yellow]")
-    except Exception as e:
-        console.print(f"[red]Fatal error: {e}[/red]")
-        console.print(traceback.format_exc())
+    app.run()
