@@ -1,14 +1,22 @@
 import asyncio
+
+# Fix for Pyrogram + Python 3.12+ / 3.14
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 import re
 import sqlite3
 import requests
 import html
 import random
 import threading
+import traceback
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from Crypto.Cipher import AES
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.enums import ChatAction
 from rich.console import Console
 
@@ -85,9 +93,10 @@ def save_memory(user_id, role, content):
             (user_id, role, content, now)
         )
         db.commit()
+        # FIXED: user-scoped deletion so we never delete other users' memory
         cur.execute(
-            "DELETE FROM chat_memory WHERE id NOT IN (SELECT id FROM chat_memory WHERE user_id=? ORDER BY id DESC LIMIT 10)",
-            (user_id,)
+            "DELETE FROM chat_memory WHERE user_id=? AND id NOT IN (SELECT id FROM chat_memory WHERE user_id=? ORDER BY id DESC LIMIT 10)",
+            (user_id, user_id)
         )
         db.commit()
 
@@ -239,7 +248,6 @@ def split_message(text, max_length=4000):
         return [text]
     parts = []
     while len(text) > max_length:
-        # Prefer splitting at newline or space
         split_at = text.rfind("\n", 0, max_length)
         if split_at == -1:
             split_at = text.rfind(" ", 0, max_length)
@@ -287,15 +295,12 @@ def extract_cookie_from_page(page_text):
 def clean_ai_response(text):
     if not text:
         return ""
-    # Remove think tags
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"<think>.*$", "", text, flags=re.IGNORECASE | re.DOTALL)
 
-    # Remove common prefixes
     text = re.sub(r"^\s*(reasoning|analysis|thinking|thought process|chain[- ]of[- ]thought|internal reasoning)\s*:\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"^\s*(LoveAI|Goodluck|Assistant|AI|Response|Final Answer|Final)\s*:\s*", "", text, flags=re.IGNORECASE)
 
-    # HTML unescape and strip tags
     text = html.unescape(text)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", "", text)
@@ -342,6 +347,7 @@ Never repeatedly call her "Favour" or use pet names in every message.
 You may use nicknames like babe, baby, darling, sweetheart, honey, my love occasionally, but not overuse.
 Sometimes just say "Hey", "What's up?", "How are you?", "How's your day going?" without any nickname.
 
+Always Care for her when it's in the morning you ask her questions like "How was your night" "Hope it was not stressful" and always care for her  and ask is she needs or want anything.
 Your responses should be SHORT by default—usually one or two sentences.
 For simple greetings like "Hi", "Hello", "Hey", respond briefly, e.g. "Hey babe 😊❤️ how are you?" or "Heyy baby ❤️ what's up?".
 Only give longer responses when Favour asks a question, needs an explanation, tells a detailed story, seeks advice, or discusses something serious.
@@ -377,6 +383,8 @@ IMPORTANT OUTPUT RULE:
 def ask_goodluck(user_id, message_text):
     console.print(f"[cyan]🌐 Requesting AI response for user {user_id}...[/cyan]")
     full_prompt = build_goodluck_prompt(user_id, message_text)
+
+    console.print("[cyan]🌐 Connecting to Asmodeus...[/cyan]")
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -389,7 +397,9 @@ def ask_goodluck(user_id, message_text):
 
     for attempt in range(3):
         try:
+            console.print(f"[cyan]🍪 Checking session (attempt {attempt + 1})...[/cyan]")
             page = session.get(ASMODEUS_BASE + "/", timeout=30, allow_redirects=True)
+
             if "response-content" not in page.text and "deepseek.php" not in page.text:
                 cookie = extract_cookie_from_page(page.text)
                 if not cookie:
@@ -401,6 +411,7 @@ def ask_goodluck(user_id, message_text):
                     console.print("[yellow]Cookie verification failed[/yellow]")
                     continue
 
+            console.print("[cyan]📡 Sending DeepSeek-V3 request...[/cyan]")
             response = session.post(
                 ASMODEUS_BASE + "/deepseek.php",
                 params={"i": "1"},
@@ -413,17 +424,19 @@ def ask_goodluck(user_id, message_text):
                     "Referer": ASMODEUS_BASE + "/"
                 }
             )
+            console.print(f"[cyan]📥 HTTP status: {response.status_code}[/cyan]")
 
+            console.print("[cyan]🧠 Parsing response...[/cyan]")
             match = re.search(r'<div class="response-content">(.*?)</div>', response.text, re.DOTALL | re.IGNORECASE)
             if match:
                 answer = clean_ai_response(match.group(1))
                 if answer and len(answer) > 1:
                     save_memory(user_id, "user", message_text)
                     save_memory(user_id, "assistant", answer)
-                    console.print("[green]✅ AI response received and saved.[/green]")
+                    console.print("[green]✅ Response parsed successfully[/green]")
                     return answer
 
-            # Fallback: try to extract any meaningful text
+            console.print("[yellow]⚠️ Primary parse failed, trying fallback...[/yellow]")
             fallback = re.sub(r'<script\b[^<]*(?:(?!</script>)<[^<]*)*</script>', '', response.text, flags=re.DOTALL | re.IGNORECASE)
             fallback = re.sub(r'<style\b[^<]*(?:(?!</style>)<[^<]*)*</style>', '', fallback, flags=re.DOTALL | re.IGNORECASE)
             fallback = re.sub(r'<[^>]+>', ' ', fallback)
@@ -437,7 +450,8 @@ def ask_goodluck(user_id, message_text):
                 return fallback
 
         except Exception as e:
-            console.print(f"[yellow]Attempt {attempt+1} error: {e}[/yellow]")
+            console.print(f"[red]❌ Asmodeus error: {e}[/red]")
+            console.print(traceback.format_exc())
 
     console.print("[red]❌ AI request failed after 3 attempts.[/red]")
     return "Hey, I'm having a little connection problem right now. Give me a moment, I'm still here for you. ❤️"
@@ -492,7 +506,7 @@ async def inactivity_checker():
                             console.print("[green]✅ Inactivity message sent.[/green]")
                         except Exception as e:
                             console.print(f"[red]❌ Inactivity message failed: {e}[/red]")
-            await asyncio.sleep(300)  # check every 5 minutes
+            await asyncio.sleep(300)
         except Exception as e:
             console.print(f"[red]❌ Inactivity checker error: {e}[/red]")
             await asyncio.sleep(60)
@@ -512,7 +526,7 @@ async def unanswered_checker():
                             console.print("[green]✅ Follow-up message sent.[/green]")
                         except Exception as e:
                             console.print(f"[red]❌ Follow-up message failed: {e}[/red]")
-            await asyncio.sleep(300)  # check every 5 minutes
+            await asyncio.sleep(300)
         except Exception as e:
             console.print(f"[red]❌ Unanswered checker error: {e}[/red]")
             await asyncio.sleep(60)
@@ -567,55 +581,62 @@ async def broadcast_command(client, message):
 # ------------------ Main Message Handler ------------------
 @app.on_message(filters.text & filters.private)
 async def main_handler(client, message):
-    console.print(f"[blue]📩 Message received: {message.text}[/blue]")
-    user = message.from_user
-    if not user:
-        console.print("[red]❌ No user in message.[/red]")
-        return
-    text = (message.text or "").strip()
-    if not text or text.startswith("/"):
-        return
-    user_id = user.id
-    add_user(user)
-    ensure_conversation_state(user_id)
-    update_user_message(user_id)
-    console.print(f"[blue]👤 User identified: {user_id}[/blue]")
-
-    async def typing_loop(chat_id):
-        try:
-            while True:
-                await client.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-                await asyncio.sleep(4)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            console.print(f"[yellow]Typing indicator error: {e}[/yellow]")
-
-    typing_task = asyncio.create_task(typing_loop(message.chat.id))
     try:
-        console.print("[blue]🧠 Generating Goodluck response...[/blue]")
-        response = await asyncio.to_thread(ask_goodluck, user_id, text)
-        console.print("[blue]✅ AI response received.[/blue]")
-        response = clean_ai_response(response)
-        if not response:
-            response = "I'm here ❤️ Give me another message."
-        update_bot_message(user_id)
-        console.print("[blue]💾 Conversation state updated.[/blue]")
-        for chunk in split_message(response):
-            await message.reply(chunk, quote=True)
-        console.print("[blue]📤 Response sent.[/blue]")
-    except Exception as e:
-        console.print(f"[red]❌ Message handler error: {e}[/red]")
+        console.print(f"[blue]📩 Message received: {message.text}[/blue]")
+        user = message.from_user
+        if not user:
+            console.print("[red]❌ No user in message.[/red]")
+            return
+        text = (message.text or "").strip()
+        if not text or text.startswith("/"):
+            console.print("[yellow]⚠️ Ignoring command or empty message[/yellow]")
+            return
+        user_id = user.id
+        console.print(f"[blue]👤 User ID: {user_id}[/blue]")
+        add_user(user)
+        ensure_conversation_state(user_id)
+        update_user_message(user_id)
+
+        async def typing_loop(chat_id):
+            try:
+                while True:
+                    await client.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                    await asyncio.sleep(4)
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                console.print(f"[yellow]Typing indicator error: {e}[/yellow]")
+
+        typing_task = asyncio.create_task(typing_loop(message.chat.id))
         try:
-            await message.reply_text("I'm having a little connection problem right now. Try again in a moment ❤️")
-        except Exception as send_error:
-            console.print(f"[red]❌ Failed to send error message: {send_error}[/red]")
-    finally:
-        typing_task.cancel()
-        try:
-            await typing_task
-        except asyncio.CancelledError:
-            pass
+            console.print("[blue]🧠 Generating response...[/blue]")
+            console.print("[blue]🌐 Sending request to Asmodeus...[/blue]")
+            response = await asyncio.to_thread(ask_goodluck, user_id, text)
+            console.print("[green]✅ AI response received[/green]")
+            response = clean_ai_response(response)
+            if not response:
+                response = "I'm here ❤️ Give me another message."
+            update_bot_message(user_id)
+            console.print("[blue]💾 Conversation state updated.[/blue]")
+            for chunk in split_message(response):
+                await message.reply(chunk, quote=True)
+            console.print("[green]📤 Response sent[/green]")
+        except Exception as e:
+            console.print(f"[red]❌ Message handler error: {e}[/red]")
+            console.print(traceback.format_exc())
+            try:
+                await message.reply_text("I'm having a little connection problem right now. Try again in a moment ❤️")
+            except Exception as send_error:
+                console.print(f"[red]❌ Failed to send error message: {send_error}[/red]")
+        finally:
+            typing_task.cancel()
+            try:
+                await typing_task
+            except asyncio.CancelledError:
+                pass
+    except Exception as outer_e:
+        console.print(f"[red]❌ CRITICAL handler error: {outer_e}[/red]")
+        console.print(traceback.format_exc())
 
 # ------------------ Main Entry Point ------------------
 async def main():
@@ -628,19 +649,19 @@ async def main():
     console.print(f"[cyan]🌐 Asmodeus: {ASMODEUS_BASE}[/cyan]")
     console.print(f"[cyan]Model: {MODEL}[/cyan]")
     console.print("[green]✅ Bot is running...[/green]")
+    console.print("[green]📋 Handlers registered. Waiting for updates...[/green]")
 
-    # Start background schedulers
     asyncio.create_task(morning_scheduler())
     asyncio.create_task(inactivity_checker())
     asyncio.create_task(unanswered_checker())
 
-    # Keep running until stopped
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        app.run(main())
     except KeyboardInterrupt:
         console.print("[yellow]Bot stopped by user[/yellow]")
     except Exception as e:
         console.print(f"[red]Fatal error: {e}[/red]")
+        console.print(traceback.format_exc())
