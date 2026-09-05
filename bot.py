@@ -583,6 +583,8 @@ async def main_handler(client, message):
     try:
         console.print(f"[blue]📩 Message received: {message.text}[/blue]")
         user = message.from_user
+        if not user or user.is_bot:
+            return
         if not user:
             console.print("[red]❌ No user in message.[/red]")
             return
