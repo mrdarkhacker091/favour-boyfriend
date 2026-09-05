@@ -1,5 +1,4 @@
 import asyncio
-import os
 import re
 import sqlite3
 import requests
@@ -13,7 +12,7 @@ from pyrogram import Client, filters
 from pyrogram.enums import ChatAction
 from rich.console import Console
 
-# ------------------ Environment & Constants ------------------
+# ------------------ Hardcoded Credentials (as per your request) ------------------
 API_ID = 34766713
 API_HASH = "e736dfb03939c175fa52722d9fef7e41"
 BOT_TOKEN = "8619061450:AAFhR2cEgs97WFGJxnN8hGB-OW4XtDu6isY"
@@ -64,7 +63,7 @@ CREATE TABLE IF NOT EXISTS conversation_state(
 """)
 db.commit()
 
-# ------------------ Helper Functions (Database) ------------------
+# ------------------ Database Helpers ------------------
 def add_user(user):
     with db_lock:
         cur.execute("SELECT * FROM users WHERE user_id=?", (user.id,))
@@ -102,29 +101,41 @@ def get_memory(user_id, limit=10):
     rows.reverse()
     return [{"role": r, "content": c} for r, c in rows]
 
+def ensure_conversation_state(user_id):
+    with db_lock:
+        cur.execute(
+            "INSERT OR IGNORE INTO conversation_state (user_id, waiting_for_reply, followup_sent, inactivity_message_sent) VALUES (?, 0, 0, 0)",
+            (user_id,)
+        )
+        db.commit()
+
 def get_conversation_state(user_id):
+    ensure_conversation_state(user_id)
     with db_lock:
         cur.execute("SELECT * FROM conversation_state WHERE user_id=?", (user_id,))
         row = cur.fetchone()
-        if not row:
-            cur.execute(
-                "INSERT INTO conversation_state (user_id, waiting_for_reply, followup_sent, inactivity_message_sent) VALUES (?,0,0,0)",
-                (user_id,)
-            )
-            db.commit()
-            cur.execute("SELECT * FROM conversation_state WHERE user_id=?", (user_id,))
-            row = cur.fetchone()
+    if not row:
         return {
-            "user_id": row[0],
-            "last_user_message": row[1],
-            "last_bot_message": row[2],
-            "waiting_for_reply": bool(row[3]),
-            "followup_sent": bool(row[4]),
-            "last_morning_message": row[5],
-            "inactivity_message_sent": bool(row[6])
+            "user_id": user_id,
+            "last_user_message": None,
+            "last_bot_message": None,
+            "waiting_for_reply": False,
+            "followup_sent": False,
+            "last_morning_message": None,
+            "inactivity_message_sent": False
         }
+    return {
+        "user_id": row[0],
+        "last_user_message": row[1],
+        "last_bot_message": row[2],
+        "waiting_for_reply": bool(row[3]),
+        "followup_sent": bool(row[4]),
+        "last_morning_message": row[5],
+        "inactivity_message_sent": bool(row[6])
+    }
 
 def update_user_message(user_id):
+    ensure_conversation_state(user_id)
     now = nigeria_now().isoformat()
     with db_lock:
         cur.execute(
@@ -138,6 +149,7 @@ def update_user_message(user_id):
         db.commit()
 
 def update_bot_message(user_id):
+    ensure_conversation_state(user_id)
     now = nigeria_now().isoformat()
     with db_lock:
         cur.execute(
@@ -151,6 +163,7 @@ def update_bot_message(user_id):
         db.commit()
 
 def set_followup_sent(user_id, value):
+    ensure_conversation_state(user_id)
     with db_lock:
         cur.execute(
             "UPDATE conversation_state SET followup_sent=? WHERE user_id=?",
@@ -159,6 +172,7 @@ def set_followup_sent(user_id, value):
         db.commit()
 
 def set_inactivity_sent(user_id, value):
+    ensure_conversation_state(user_id)
     with db_lock:
         cur.execute(
             "UPDATE conversation_state SET inactivity_message_sent=? WHERE user_id=?",
@@ -173,6 +187,7 @@ def get_last_morning_message(user_id):
     return row[0] if row and row[0] else None
 
 def set_last_morning_message(user_id, dt_str):
+    ensure_conversation_state(user_id)
     with db_lock:
         cur.execute(
             "UPDATE conversation_state SET last_morning_message=? WHERE user_id=?",
@@ -211,21 +226,20 @@ def time_period():
         return "late_night"
 
 def is_simple_greeting(text):
-    text = text.lower().strip()
-    greetings = [
+    text_clean = re.sub(r"[^\w\s]", "", text.lower().strip())
+    greetings = {
         "hi", "hello", "hey", "hii", "hiii", "heyy",
-        "good morning", "good afternoon", "good evening",
-        "morning", "afternoon", "evening"
-    ]
-    # Remove punctuation for matching
-    text_clean = re.sub(r'[^\w\s]', '', text)
-    return any(text_clean == g or text_clean.startswith(g + " ") or text_clean == g for g in greetings)
+        "morning", "afternoon", "evening",
+        "good morning", "good afternoon", "good evening"
+    }
+    return text_clean in greetings
 
 def split_message(text, max_length=4000):
     if len(text) <= max_length:
         return [text]
     parts = []
     while len(text) > max_length:
+        # Prefer splitting at newline or space
         split_at = text.rfind("\n", 0, max_length)
         if split_at == -1:
             split_at = text.rfind(" ", 0, max_length)
@@ -361,6 +375,7 @@ IMPORTANT OUTPUT RULE:
 
 # ------------------ AI Request (Asmodeus) ------------------
 def ask_goodluck(user_id, message_text):
+    console.print(f"[cyan]🌐 Requesting AI response for user {user_id}...[/cyan]")
     full_prompt = build_goodluck_prompt(user_id, message_text)
     session = requests.Session()
     session.headers.update({
@@ -405,8 +420,10 @@ def ask_goodluck(user_id, message_text):
                 if answer and len(answer) > 1:
                     save_memory(user_id, "user", message_text)
                     save_memory(user_id, "assistant", answer)
+                    console.print("[green]✅ AI response received and saved.[/green]")
                     return answer
 
+            # Fallback: try to extract any meaningful text
             fallback = re.sub(r'<script\b[^<]*(?:(?!</script>)<[^<]*)*</script>', '', response.text, flags=re.DOTALL | re.IGNORECASE)
             fallback = re.sub(r'<style\b[^<]*(?:(?!</style>)<[^<]*)*</style>', '', fallback, flags=re.DOTALL | re.IGNORECASE)
             fallback = re.sub(r'<[^>]+>', ' ', fallback)
@@ -416,11 +433,13 @@ def ask_goodluck(user_id, message_text):
             if fallback and len(fallback) > 20 and "error" not in fallback.lower():
                 save_memory(user_id, "user", message_text)
                 save_memory(user_id, "assistant", fallback)
+                console.print("[green]✅ Fallback response saved.[/green]")
                 return fallback
 
         except Exception as e:
             console.print(f"[yellow]Attempt {attempt+1} error: {e}[/yellow]")
 
+    console.print("[red]❌ AI request failed after 3 attempts.[/red]")
     return "Hey, I'm having a little connection problem right now. Give me a moment, I'm still here for you. ❤️"
 
 # ------------------ Proactive Messages ------------------
@@ -449,11 +468,12 @@ async def morning_scheduler():
                     try:
                         await app.send_message(FAVOUR_USER_ID, msg)
                         set_last_morning_message(FAVOUR_USER_ID, now.isoformat())
+                        console.print("[green]✅ Morning message sent.[/green]")
                     except Exception as e:
-                        console.print(f"[red]Morning message failed: {e}[/red]")
-            await asyncio.sleep(30)  # check every 30 seconds
+                        console.print(f"[red]❌ Morning message failed: {e}[/red]")
+            await asyncio.sleep(30)
         except Exception as e:
-            console.print(f"[red]Morning scheduler error: {e}[/red]")
+            console.print(f"[red]❌ Morning scheduler error: {e}[/red]")
             await asyncio.sleep(60)
 
 async def inactivity_checker():
@@ -469,11 +489,12 @@ async def inactivity_checker():
                         try:
                             await app.send_message(FAVOUR_USER_ID, msg)
                             set_inactivity_sent(FAVOUR_USER_ID, True)
+                            console.print("[green]✅ Inactivity message sent.[/green]")
                         except Exception as e:
-                            console.print(f"[red]Inactivity message failed: {e}[/red]")
+                            console.print(f"[red]❌ Inactivity message failed: {e}[/red]")
             await asyncio.sleep(300)  # check every 5 minutes
         except Exception as e:
-            console.print(f"[red]Inactivity checker error: {e}[/red]")
+            console.print(f"[red]❌ Inactivity checker error: {e}[/red]")
             await asyncio.sleep(60)
 
 async def unanswered_checker():
@@ -488,11 +509,12 @@ async def unanswered_checker():
                         try:
                             await app.send_message(FAVOUR_USER_ID, "??")
                             set_followup_sent(FAVOUR_USER_ID, True)
+                            console.print("[green]✅ Follow-up message sent.[/green]")
                         except Exception as e:
-                            console.print(f"[red]Follow-up message failed: {e}[/red]")
+                            console.print(f"[red]❌ Follow-up message failed: {e}[/red]")
             await asyncio.sleep(300)  # check every 5 minutes
         except Exception as e:
-            console.print(f"[red]Unanswered checker error: {e}[/red]")
+            console.print(f"[red]❌ Unanswered checker error: {e}[/red]")
             await asyncio.sleep(60)
 
 # ------------------ Pyrogram Client ------------------
@@ -532,8 +554,9 @@ async def broadcast_command(client, message):
         try:
             await message.reply_to_message.copy(user[0])
             success += 1
-        except Exception:
+        except Exception as e:
             failed += 1
+            console.print(f"[yellow]Broadcast failed for {user[0]}: {e}[/yellow]")
         if (success + failed) % 50 == 0:
             try:
                 await status_msg.edit_text(f"Broadcasting... Total: {total}, Sent: {success}, Failed: {failed}")
@@ -544,39 +567,49 @@ async def broadcast_command(client, message):
 # ------------------ Main Message Handler ------------------
 @app.on_message(filters.text & filters.private)
 async def main_handler(client, message):
+    console.print(f"[blue]📩 Message received: {message.text}[/blue]")
     user = message.from_user
     if not user:
+        console.print("[red]❌ No user in message.[/red]")
         return
-    text = message.text.strip()
+    text = (message.text or "").strip()
     if not text or text.startswith("/"):
         return
     user_id = user.id
     add_user(user)
-
-    # Update user message state
+    ensure_conversation_state(user_id)
     update_user_message(user_id)
+    console.print(f"[blue]👤 User identified: {user_id}[/blue]")
 
-    async def typing_indicator():
+    async def typing_loop(chat_id):
         try:
             while True:
-                await client.send_chat_action(
-                    chat_id=message.chat.id,
-                    action=ChatAction.TYPING
-                )
+                await client.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
                 await asyncio.sleep(4)
         except asyncio.CancelledError:
             pass
         except Exception as e:
             console.print(f"[yellow]Typing indicator error: {e}[/yellow]")
 
-    typing_task = asyncio.create_task(typing_indicator())
-
+    typing_task = asyncio.create_task(typing_loop(message.chat.id))
     try:
-        response = await asyncio.to_thread(
-            ask_goodluck,
-            user_id,
-            text
-        )
+        console.print("[blue]🧠 Generating Goodluck response...[/blue]")
+        response = await asyncio.to_thread(ask_goodluck, user_id, text)
+        console.print("[blue]✅ AI response received.[/blue]")
+        response = clean_ai_response(response)
+        if not response:
+            response = "I'm here ❤️ Give me another message."
+        update_bot_message(user_id)
+        console.print("[blue]💾 Conversation state updated.[/blue]")
+        for chunk in split_message(response):
+            await message.reply(chunk, quote=True)
+        console.print("[blue]📤 Response sent.[/blue]")
+    except Exception as e:
+        console.print(f"[red]❌ Message handler error: {e}[/red]")
+        try:
+            await message.reply_text("I'm having a little connection problem right now. Try again in a moment ❤️")
+        except Exception as send_error:
+            console.print(f"[red]❌ Failed to send error message: {send_error}[/red]")
     finally:
         typing_task.cancel()
         try:
@@ -584,19 +617,11 @@ async def main_handler(client, message):
         except asyncio.CancelledError:
             pass
 
-    response = clean_ai_response(response)
-    if not response:
-        response = "Hmm 😅 I think my response got lost. Try again."
-
-    # Update bot message state
-    update_bot_message(user_id)
-
-    for part in split_message(response):
-        await message.reply(part, quote=True)
-
 # ------------------ Main Entry Point ------------------
 async def main():
     await app.start()
+    me = await app.get_me()
+    console.print(f"[green]✅ Logged in as @{me.username} (ID: {me.id})[/green]")
     console.print("[green]❤️ Goodluck Bot Starting...[/green]")
     console.print(f"[yellow]👤 Owner ID: {OWNER_ID}[/yellow]")
     console.print(f"[yellow]💬 Favour User ID: {FAVOUR_USER_ID}[/yellow]")
